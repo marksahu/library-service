@@ -42,7 +42,6 @@ docker compose up --build
 |-|-|
 |Frontend|http://localhost:3000|
 |API docs|http://localhost:8000/docs|
-|API|http://localhost:8000|
 |DB|localhost:5432 (user/pass: `library`)|
 
 The PostgreSQL `init.sql` script runs automatically on first start, creating all tables, indexes, views, and seed data.
@@ -265,7 +264,7 @@ python -m grpc\_tools.protoc \\
 
 
 
-How to run library-service
+## How to run library-service
 
 
 
