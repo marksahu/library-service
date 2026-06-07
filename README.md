@@ -276,7 +276,7 @@ Make sure Docker Desktop is running Open Docker Desktop and wait for it to say "
 
 
 
-Unzip the project Check out the library-service
+Check out the library-service
 
 
 
