@@ -11,18 +11,19 @@ Check out the library-service
 
 4. Open a terminal in that folder
  cmd  ~/Desktop/library-service
-5. Start everything
+5. Start everything -
    docker compose up --build
 
 This will take 2–3 minutes the first time (downloading images, installing dependencies). You'll see logs from three services: db, backend, and frontend.
 5. Wait for this line in the logs
 library_backend  | INFO:     Application startup complete.
+
 That means the API is ready.
 6. Open the app
 
 Frontend UI → http://localhost:3000
 API docs (Swagger) → http://localhost:8000/docs
 
-7. To stop everything
-Press Ctrl + C in the terminal, then:
+7. To stop everything-
+Press Ctrl + C in the terminal, then:-
 bashdocker compose down
