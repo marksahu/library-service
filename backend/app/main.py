@@ -1,51 +1,91 @@
 """
-Neighborhood Library Service – FastAPI application entry point.
+app/main.py
+
+FastAPI application – routing only.
+Business logic lives in services; DB queries live in repositories.
 """
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, func, and_
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import engine, Base, AsyncSessionLocal, get_db
-from app.models import orm  # noqa: F401 – register all ORM models with Base
+from app.core.exceptions import (
+    LibraryError, NotFoundError, ConflictError, BusinessRuleError,
+)
+from app.core.logging import configure_logging, get_logger
+from app.core.middleware import RequestContextMiddleware
+from app.db.session import engine, Base, get_db
+from app.models import orm  # noqa: F401 – registers ORM models with Base
 from app.models.schemas import (
     BookCreate, BookUpdate, BookOut, BookList,
     MemberCreate, MemberUpdate, MemberOut, MemberList,
     BorrowRequest, LoanOut, LoanList,
     DashboardStats,
 )
-from app.services import book_service, member_service, loan_service
-from app.models.orm import Loan
+from app.services import book_service, member_service, loan_service, dashboard_service
+
+configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
+logger = get_logger(__name__)
 
 
 # ─── Lifespan ─────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables if they don't exist (DDL already in init.sql; this is a safety net)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    logger.info("application_startup")
     yield
+    logger.info("application_shutdown")
 
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Neighborhood Library Service",
-    description="REST API for managing library books, members, and borrowing operations.",
+    description="REST API for managing library books, members, and borrowing.",
     version="1.0.0",
     lifespan=lifespan,
 )
 
+app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ─── Global exception handlers ────────────────────────────────────────────────
+
+_STATUS_MAP = {
+    NotFoundError:     404,
+    ConflictError:     409,
+    BusinessRuleError: 400,
+}
+
+
+@app.exception_handler(LibraryError)
+async def library_error_handler(request: Request, exc: LibraryError) -> JSONResponse:
+    status_code = _STATUS_MAP.get(type(exc), 500)
+    logger.warning(
+        "domain_error",
+        error_type=type(exc).__name__,
+        message=exc.message,
+        path=request.url.path,
+    )
+    return JSONResponse(status_code=status_code, content={"detail": exc.message})
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("unhandled_error", path=request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "An unexpected error occurred."})
 
 
 # ─── Books ────────────────────────────────────────────────────────────────────
@@ -57,7 +97,7 @@ async def create_book(data: BookCreate, db: AsyncSession = Depends(get_db)):
 
 @app.get("/books", response_model=BookList, tags=["Books"])
 async def list_books(
-    search: Optional[str] = Query(None, description="Search by title or author"),
+    search: Optional[str] = Query(None),
     page:   int = Query(1,  ge=1),
     limit:  int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -128,11 +168,11 @@ async def return_book(loan_id: int, db: AsyncSession = Depends(get_db)):
 
 @app.get("/loans", response_model=LoanList, tags=["Loans"])
 async def list_loans(
-    member_id:   Optional[int]  = Query(None),
-    book_id:     Optional[int]  = Query(None),
-    active_only: bool           = Query(False),
-    page:        int            = Query(1, ge=1),
-    limit:       int            = Query(20, ge=1, le=100),
+    member_id:   Optional[int] = Query(None),
+    book_id:     Optional[int] = Query(None),
+    active_only: bool          = Query(False),
+    page:        int           = Query(1, ge=1),
+    limit:       int           = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
     loans, total = await loan_service.list_loans(db, member_id, book_id, active_only, page, limit)
@@ -148,35 +188,20 @@ async def get_loan(loan_id: int, db: AsyncSession = Depends(get_db)):
 
 @app.get("/dashboard", response_model=DashboardStats, tags=["Dashboard"])
 async def dashboard(db: AsyncSession = Depends(get_db)):
-    from app.models.orm import Book, Member
-    from datetime import datetime, timezone
-
-    total_books   = await db.scalar(select(func.count()).select_from(Book))
-    total_members = await db.scalar(select(func.count()).select_from(Member).where(Member.active == True))
-    active_loans  = await db.scalar(
-        select(func.count()).select_from(Loan).where(Loan.returned_at.is_(None))
-    )
-    now = datetime.now(timezone.utc)
-    overdue_loans = await db.scalar(
-        select(func.count()).select_from(Loan).where(
-            and_(Loan.returned_at.is_(None), Loan.due_at < now)
-        )
-    )
-    total_fines = await db.scalar(
-        select(func.coalesce(func.sum(Loan.fine_amount), 0)).where(Loan.fine_amount > 0)
-    )
-
-    return DashboardStats(
-        total_books=total_books or 0,
-        total_members=total_members or 0,
-        active_loans=active_loans or 0,
-        overdue_loans=overdue_loans or 0,
-        total_fines=float(total_fines or 0),
-    )
+    return await dashboard_service.get_stats(db)
 
 
-# ─── Health ───────────────────────────────────────────────────────────────────
+# ─── Health (DB-aware) ────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["Health"])
-async def health():
-    return {"status": "ok"}
+async def health(db: AsyncSession = Depends(get_db)):
+    try:
+        from sqlalchemy import text
+        await db.execute(text("SELECT 1"))
+        return {"status": "ok", "database": "reachable"}
+    except Exception as exc:
+        logger.error("health_check_failed", error=str(exc))
+        return JSONResponse(
+            status_code=503,
+            content={"status": "degraded", "database": "unreachable"},
+        )

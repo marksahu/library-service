@@ -1,34 +1,47 @@
 """
-Loan service – borrow, return, fine calculation.
+app/services/loan_service.py
+
+Loan business logic – borrow, return, fine calculation.
 Fine rate: $0.25 per overdue day.
+No FastAPI imports.
 """
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple, List
 from decimal import Decimal
+from typing import Optional, Tuple, List
 
-from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-from fastapi import HTTPException
 
-from app.models.orm import Book, Member, Loan
+from app.core.exceptions import NotFoundError, ConflictError, BusinessRuleError
+from app.core.logging import get_logger
+from app.models.orm import Loan
 from app.models.schemas import BorrowRequest, LoanOut
+from app.repositories.book_repo import BookRepository
+from app.repositories.loan_repo import LoanRepository
+from app.repositories.member_repo import MemberRepository
+
+logger = get_logger(__name__)
 
 FINE_PER_DAY = Decimal("0.25")
 DEFAULT_LOAN_DAYS = 14
 
 
-def _build_loan_out(loan: Loan) -> LoanOut:
-    """Enrich a Loan ORM object into the response schema."""
-    now = datetime.now(timezone.utc)
-    due = loan.due_at.replace(tzinfo=timezone.utc) if loan.due_at.tzinfo is None else loan.due_at
-    overdue = loan.returned_at is None and now > due
+def _compute_fine(due_at: datetime, now: datetime) -> float:
+    """Calculate live fine for an unreturned overdue loan."""
+    due = due_at.replace(tzinfo=timezone.utc) if due_at.tzinfo is None else due_at
+    if now <= due:
+        return 0.0
+    days_late = (now - due).total_seconds() / 86400
+    return round(float(FINE_PER_DAY) * days_late, 2)
 
-    if overdue:
-        days_late = (now - due).total_seconds() / 86400
-        fine = round(float(FINE_PER_DAY) * days_late, 2)
+
+def _to_loan_out(loan: Loan) -> LoanOut:
+    now = datetime.now(timezone.utc)
+    if loan.returned_at is None:
+        fine = _compute_fine(loan.due_at, now)
+        overdue = fine > 0
     else:
         fine = float(loan.fine_amount)
+        overdue = False
 
     return LoanOut(
         id=loan.id,
@@ -44,47 +57,26 @@ def _build_loan_out(loan: Loan) -> LoanOut:
     )
 
 
-async def _load_loan(db: AsyncSession, loan_id: int) -> Loan:
-    result = await db.execute(
-        select(Loan)
-        .options(selectinload(Loan.member), selectinload(Loan.book))
-        .where(Loan.id == loan_id)
-    )
-    loan = result.scalar_one_or_none()
-    if not loan:
-        raise HTTPException(404, detail=f"Loan {loan_id} not found.")
-    return loan
-
-
 async def borrow_book(db: AsyncSession, data: BorrowRequest) -> LoanOut:
-    # Validate member
-    member = await db.get(Member, data.member_id)
+    member_repo = MemberRepository(db)
+    book_repo   = BookRepository(db)
+    loan_repo   = LoanRepository(db)
+
+    member = await member_repo.get_by_id(data.member_id)
     if not member:
-        raise HTTPException(404, detail=f"Member {data.member_id} not found.")
+        raise NotFoundError(f"Member {data.member_id} not found.")
     if not member.active:
-        raise HTTPException(400, detail="Inactive member cannot borrow books.")
+        raise BusinessRuleError("Inactive member cannot borrow books.")
 
-    # Validate book
-    book = await db.get(Book, data.book_id)
+    book = await book_repo.get_by_id(data.book_id)
     if not book:
-        raise HTTPException(404, detail=f"Book {data.book_id} not found.")
+        raise NotFoundError(f"Book {data.book_id} not found.")
     if book.available < 1:
-        raise HTTPException(409, detail=f"'{book.title}' has no available copies right now.")
+        raise ConflictError(f"'{book.title}' has no available copies right now.")
 
-    # Check member doesn't already have this book out
-    existing = await db.scalar(
-        select(Loan).where(
-            and_(
-                Loan.member_id == data.member_id,
-                Loan.book_id   == data.book_id,
-                Loan.returned_at.is_(None),
-            )
-        )
-    )
-    if existing:
-        raise HTTPException(409, detail="This member already has this book checked out.")
+    if await loan_repo.find_active(data.member_id, data.book_id):
+        raise ConflictError("This member already has this book checked out.")
 
-    # Create loan
     loan_days = data.loan_days or DEFAULT_LOAN_DAYS
     now = datetime.now(timezone.utc)
     loan = Loan(
@@ -94,38 +86,41 @@ async def borrow_book(db: AsyncSession, data: BorrowRequest) -> LoanOut:
         due_at=now + timedelta(days=loan_days),
     )
     book.available -= 1
-    db.add(loan)
-    await db.flush()
+    loan = await loan_repo.save(loan)
 
-    loan = await _load_loan(db, loan.id)
-    return _build_loan_out(loan)
+    # Reload with relationships for the response
+    loan = await loan_repo.get_by_id(loan.id)
+    logger.info("book_borrowed", loan_id=loan.id, member_id=data.member_id, book_id=data.book_id)
+    return _to_loan_out(loan)
 
 
 async def return_book(db: AsyncSession, loan_id: int) -> LoanOut:
-    loan = await _load_loan(db, loan_id)
-
+    loan_repo = LoanRepository(db)
+    loan = await loan_repo.get_by_id(loan_id)
+    if not loan:
+        raise NotFoundError(f"Loan {loan_id} not found.")
     if loan.returned_at is not None:
-        raise HTTPException(400, detail="This book has already been returned.")
+        raise BusinessRuleError("This book has already been returned.")
 
     now = datetime.now(timezone.utc)
     loan.returned_at = now
-
-    # Calculate final fine
-    due = loan.due_at.replace(tzinfo=timezone.utc) if loan.due_at.tzinfo is None else loan.due_at
-    if now > due:
-        days_late = (now - due).total_seconds() / 86400
-        loan.fine_amount = round(float(FINE_PER_DAY) * days_late, 2)
-
-    # Restore book availability
+    loan.fine_amount = _compute_fine(loan.due_at, now)
     loan.book.available += 1
 
-    await db.flush()
-    return _build_loan_out(loan)
+    await loan_repo.save(loan)
+    logger.info(
+        "book_returned",
+        loan_id=loan_id,
+        fine_amount=float(loan.fine_amount),
+    )
+    return _to_loan_out(loan)
 
 
 async def get_loan(db: AsyncSession, loan_id: int) -> LoanOut:
-    loan = await _load_loan(db, loan_id)
-    return _build_loan_out(loan)
+    loan = await LoanRepository(db).get_by_id(loan_id)
+    if not loan:
+        raise NotFoundError(f"Loan {loan_id} not found.")
+    return _to_loan_out(loan)
 
 
 async def list_loans(
@@ -136,22 +131,5 @@ async def list_loans(
     page: int = 1,
     limit: int = 20,
 ) -> Tuple[List[LoanOut], int]:
-    query = (
-        select(Loan)
-        .options(selectinload(Loan.member), selectinload(Loan.book))
-    )
-    if member_id:
-        query = query.where(Loan.member_id == member_id)
-    if book_id:
-        query = query.where(Loan.book_id == book_id)
-    if active_only:
-        query = query.where(Loan.returned_at.is_(None))
-
-    total = await db.scalar(select(func.count()).select_from(query.subquery()))
-    loans = (await db.scalars(
-        query.order_by(Loan.borrowed_at.desc())
-             .offset((page - 1) * limit)
-             .limit(limit)
-    )).all()
-
-    return [_build_loan_out(l) for l in loans], total or 0
+    loans, total = await LoanRepository(db).list(member_id, book_id, active_only, page, limit)
+    return [_to_loan_out(l) for l in loans], total
