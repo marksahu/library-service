@@ -33,6 +33,7 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://library:library@db:5432/librarydb
+      #DATABASE_URL: postgresql+asyncpg://library:library@localhost:5432/librarydb
       SQL_ECHO:     "false"
     ports:
       - "8000:8000"
