@@ -1,7 +1,7 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { API_BASE, ENDPOINTS, PAGE_SIZE } from "./constants";
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json", ...options?.headers },
     ...options,
   });
@@ -34,48 +34,53 @@ export interface DashboardStats {
   active_loans: number; overdue_loans: number; total_fines: number;
 }
 
-// ─── Books ────────────────────────────────────────────────────────────────────
+// ─── API client ───────────────────────────────────────────────────────────────
 
 export const api = {
   books: {
-    list:   (search = "", page = 1) =>
-      request<{ books: Book[]; total: number }>(`/books?search=${search}&page=${page}&limit=20`),
-    get:    (id: number)           => request<Book>(`/books/${id}`),
+    list: (search = "", page = 1) =>
+      request<{ books: Book[]; total: number }>(
+        `${ENDPOINTS.books}?search=${encodeURIComponent(search)}&page=${page}&limit=${PAGE_SIZE}`
+      ),
+    get:    (id: number) => request<Book>(ENDPOINTS.book(id)),
     create: (data: Omit<Book, "id" | "available">) =>
-      request<Book>("/books", { method: "POST", body: JSON.stringify(data) }),
+      request<Book>(ENDPOINTS.books, { method: "POST", body: JSON.stringify(data) }),
     update: (id: number, data: Partial<Book>) =>
-      request<Book>(`/books/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
-    delete: (id: number) => request<void>(`/books/${id}`, { method: "DELETE" }),
+      request<Book>(ENDPOINTS.book(id), { method: "PATCH", body: JSON.stringify(data) }),
+    delete: (id: number) => request<void>(ENDPOINTS.book(id), { method: "DELETE" }),
   },
 
   members: {
-    list:   (search = "", page = 1) =>
-      request<{ members: Member[]; total: number }>(`/members?search=${search}&page=${page}&limit=20`),
-    get:    (id: number)            => request<Member>(`/members/${id}`),
+    list: (search = "", page = 1) =>
+      request<{ members: Member[]; total: number }>(
+        `${ENDPOINTS.members}?search=${encodeURIComponent(search)}&page=${page}&limit=${PAGE_SIZE}`
+      ),
+    get:    (id: number) => request<Member>(ENDPOINTS.member(id)),
     create: (data: Omit<Member, "id" | "active" | "joined_at">) =>
-      request<Member>("/members", { method: "POST", body: JSON.stringify(data) }),
+      request<Member>(ENDPOINTS.members, { method: "POST", body: JSON.stringify(data) }),
     update: (id: number, data: Partial<Member>) =>
-      request<Member>(`/members/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
-    delete: (id: number) => request<void>(`/members/${id}`, { method: "DELETE" }),
+      request<Member>(ENDPOINTS.member(id), { method: "PATCH", body: JSON.stringify(data) }),
+    delete: (id: number) => request<void>(ENDPOINTS.member(id), { method: "DELETE" }),
   },
 
   loans: {
     list: (params: { member_id?: number; book_id?: number; active_only?: boolean; page?: number }) => {
       const q = new URLSearchParams();
-      if (params.member_id)  q.set("member_id",   String(params.member_id));
-      if (params.book_id)    q.set("book_id",      String(params.book_id));
-      if (params.active_only) q.set("active_only", "true");
-      q.set("page", String(params.page ?? 1));
-      return request<{ loans: Loan[]; total: number }>(`/loans?${q}`);
+      if (params.member_id)   q.set("member_id",   String(params.member_id));
+      if (params.book_id)     q.set("book_id",      String(params.book_id));
+      if (params.active_only) q.set("active_only",  "true");
+      q.set("page",  String(params.page ?? 1));
+      q.set("limit", String(PAGE_SIZE));
+      return request<{ loans: Loan[]; total: number }>(`${ENDPOINTS.loans}?${q}`);
     },
     borrow: (member_id: number, book_id: number, loan_days = 14) =>
-      request<Loan>("/loans/borrow", {
+      request<Loan>(ENDPOINTS.borrow, {
         method: "POST",
         body: JSON.stringify({ member_id, book_id, loan_days }),
       }),
     returnBook: (loan_id: number) =>
-      request<Loan>(`/loans/${loan_id}/return`, { method: "POST" }),
+      request<Loan>(ENDPOINTS.returnLoan(loan_id), { method: "POST" }),
   },
 
-  dashboard: () => request<DashboardStats>("/dashboard"),
+  dashboard: () => request<DashboardStats>(ENDPOINTS.dashboard),
 };
